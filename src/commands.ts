@@ -4,7 +4,7 @@ import { isResolvedKey } from './types';
 import { ConfigReader, type ProviderOrigin, type WorkspaceScope } from './config/workspaceConfig';
 import { deriveProviderId, sanitizeProviderTitle, suggestProviderTitle } from './config/providerDraft';
 import { KeyResolver } from './auth/keyResolver';
-import type { StoredKey } from './auth/keyRegistry';
+import type { ReusableKey } from './auth/keyResolver';
 import { BaseUrlConsent, originOf } from './security/baseUrlConsent';
 import { validateBaseUrl } from './security/endpointUrl';
 import { WorkspaceKeysChatProvider } from './provider/chatProvider';
@@ -332,36 +332,112 @@ async function setKey(deps: CommandDeps, providerId?: string): Promise<void> {
 		return;
 	}
 
-	// Offered only for endpoints from user settings: a workspace could declare a
-	// known provider id with a different base URL and so collect an existing key.
-	const reusable = origin === 'user' ? deps.keys.reusableKeys(provider.id, scope.workspaceKey) : [];
+	// A provider id is chosen by whoever writes the settings, so it never decides
+	// on its own. Workspace-declared providers are offered only keys whose
+	// recorded endpoint equals this exact base URL; user-settings providers also
+	// see keys without a recorded endpoint, marked as unverified.
+	const requireVerified = origin === 'workspace';
+	const reusable = deps.keys.reusableKeys(provider.id, scope.workspaceKey, provider.baseUrl, requireVerified);
 	const answer = await askForKey(provider, reusable);
 	if (answer === undefined) {
 		return;
 	}
 
+	// Every dialog is asynchronous: settings, folder or approval may change while
+	// one is open. `destinationValid` is re-evaluated after each of them and
+	// again immediately before the secret is written (inside `store`/`copyFrom`).
+	const destinationValid = (): boolean => isSameDestination(deps, scope, origin, provider);
+	const changed = (): void => {
+		log().warn(`Provider "${provider.id}" configuration changed while a key dialog was open; nothing was stored.`);
+		void vscode.window.showWarningMessage(
+			'Workspace Keys: the provider configuration changed while the key dialog was open. Nothing was stored.',
+		);
+	};
+	if (!destinationValid()) {
+		changed();
+		return;
+	}
+
 	if (answer.kind === 'reuse') {
-		const copied = await deps.keys.copyFrom(answer.entry.name, provider.id, scope.workspaceKey, scope.identityUri);
-		if (!copied) {
-			void vscode.window.showWarningMessage('Workspace Keys: that stored key no longer exists. Enter a new key instead.');
+		if (requireVerified && !(await confirmReuse(provider, answer.entry))) {
 			return;
 		}
-		log().info(`Reused the stored key of "${answer.entry.label}" for provider "${provider.id}" in this workspace.`);
+		if (!destinationValid()) {
+			changed();
+			return;
+		}
+		const copied = await deps.keys.copyFrom(
+			answer.entry,
+			provider.id,
+			provider.baseUrl,
+			scope.workspaceKey,
+			scope.identityUri,
+			destinationValid,
+		);
+		if (!copied) {
+			const reason = destinationValid() ? 'that stored key changed or no longer exists' : 'the provider configuration changed';
+			log().warn(`Did not reuse the stored key of "${answer.entry.label}" for provider "${provider.id}": ${reason}.`);
+			void vscode.window.showWarningMessage(`Workspace Keys: ${reason}. Nothing was copied.`);
+			return;
+		}
+		log().info(
+			`Reused the stored key of "${answer.entry.label}" for provider "${provider.id}" in this workspace (${answer.entry.verified ? 'endpoint verified' : 'endpoint not recorded'}).`,
+		);
 	} else {
-		await deps.keys.store(provider.id, scope.workspaceKey, answer.key, scope.identityUri);
+		if (!(await deps.keys.store(provider.id, scope.workspaceKey, answer.key, scope.identityUri, provider.baseUrl, destinationValid))) {
+			changed();
+			return;
+		}
 		log().info(`Stored a key for provider "${provider.id}" in this workspace.`);
 	}
 	void vscode.window.showInformationMessage(`Workspace Keys: key for "${provider.label ?? provider.id}" stored for this workspace.`);
 	deps.provider.refresh();
 }
 
-type KeyAnswer = { kind: 'new'; key: string } | { kind: 'reuse'; entry: StoredKey };
+/**
+ * Whether the workspace, provider origin, exact base URL and (for workspace
+ * providers) endpoint approval are still what the user was shown. Reads the
+ * live configuration; it cannot make SecretStorage and settings one
+ * transaction, so a change landing between this check and the write is not
+ * excluded — only narrowed to the synchronous gap before `secrets.store`.
+ */
+function isSameDestination(deps: CommandDeps, scope: WorkspaceScope, origin: ProviderOrigin, provider: ProviderConfig): boolean {
+	const now = deps.config.currentScope();
+	if (now.workspaceKey !== scope.workspaceKey) {
+		return false;
+	}
+	const current = deps.config.readProviders(now.folder);
+	const still = current.providers.find((entry) => entry.id === provider.id);
+	return (
+		current.origin === origin &&
+		still?.baseUrl === provider.baseUrl &&
+		(origin !== 'workspace' || deps.consent.isApproved(provider.baseUrl, 'workspace'))
+	);
+}
+
+/** Final, modal confirmation before a key is copied to a workspace-declared endpoint. */
+async function confirmReuse(provider: ProviderConfig, entry: ReusableKey): Promise<boolean> {
+	const choice = await vscode.window.showWarningMessage(
+		`Copy the key stored for "${entry.label}" to this workspace?`,
+		{
+			modal: true,
+			detail:
+				`${provider.baseUrl}\n\n` +
+				'This provider is declared by this workspace. The key was stored for exactly this base URL, but it will now also be sent ' +
+				'from this workspace. Copy it only if this workspace should use the same account.',
+		},
+		'Copy Key',
+	);
+	return choice === 'Copy Key';
+}
+
+type KeyAnswer = { kind: 'new'; key: string } | { kind: 'reuse'; entry: ReusableKey };
 
 /**
  * Asks for an API key. When keys for the same provider exist in other
  * workspaces, a title-bar button lets the user pick one of those instead.
  */
-async function askForKey(provider: ProviderConfig, reusable: readonly StoredKey[]): Promise<KeyAnswer | undefined> {
+async function askForKey(provider: ProviderConfig, reusable: readonly ReusableKey[]): Promise<KeyAnswer | undefined> {
 	const reuseButton: vscode.QuickInputButton = {
 		iconPath: new vscode.ThemeIcon('history'),
 		tooltip: 'Use a key stored for another workspace',
@@ -369,7 +445,7 @@ async function askForKey(provider: ProviderConfig, reusable: readonly StoredKey[
 
 	const input = vscode.window.createInputBox();
 	input.title = `API key for "${provider.label ?? provider.id}"`;
-	input.prompt = 'Stored in SecretStorage for this workspace only. It is not written to settings.';
+	input.prompt = `For ${provider.baseUrl}. Stored in SecretStorage for this workspace only. It is not written to settings.`;
 	input.password = true;
 	input.ignoreFocusOut = true;
 	if (reusable.length > 0) {
@@ -406,7 +482,7 @@ async function askForKey(provider: ProviderConfig, reusable: readonly StoredKey[
 			}
 			const items = reusable.map((entry) => ({
 				label: `$(key) ${entry.label}`,
-				description: entry.providerId,
+				description: entry.verified ? `${entry.providerId} · same endpoint` : `${entry.providerId} · endpoint not recorded`,
 				detail: `${entry.adopted ? 'first seen' : 'stored'} ${formatDate(entry.storedAt)}${
 					entry.lastUsedAt ? ` · last used ${formatDate(entry.lastUsedAt)}` : ''
 				}`,

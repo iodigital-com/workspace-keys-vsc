@@ -292,57 +292,215 @@ describe('resolution memo', () => {
 describe('reusing a stored key', () => {
 	const OTHER = 'file:///c%3A/workspace/kunde-b/shop';
 	const OTHER_IDENTITY: IdentitySource = { scheme: 'file', fsPath: 'c:\\workspace\\kunde-b\\shop' };
+	const URL_A = 'https://api.example.com/v1';
+	const URL_B = 'https://evil.example.net/v1';
 
 	beforeEach(() => {
 		birthtime = 5_000_000;
 		build();
 	});
 
-	test('offers keys of the same provider from other workspaces only', async () => {
-		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY);
-		await keys.store('anthropic', OTHER, 'sk-different-provider', OTHER_IDENTITY);
-		await keys.store('openai', WORKSPACE, 'sk-own', IDENTITY);
+	const pick = (baseUrl: string, requireVerified: boolean) => keys.reusableKeys('openai', WORKSPACE, baseUrl, requireVerified);
 
-		const offered = keys.reusableKeys('openai', WORKSPACE);
+	test('offers keys of the same provider from other workspaces only', async () => {
+		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY, URL_A);
+		await keys.store('anthropic', OTHER, 'sk-anthropic', OTHER_IDENTITY, URL_A);
+		await keys.store('openai', WORKSPACE, 'sk-own', IDENTITY, URL_A);
+
 		assert.deepEqual(
-			offered.map((entry) => entry.name),
+			pick(URL_A, false).map((entry) => entry.name),
 			[keys.secretNameFor('openai', OTHER)],
 		);
 	});
 
 	test('offers nothing when no other workspace has a key', async () => {
-		await keys.store('openai', WORKSPACE, 'sk-own', IDENTITY);
-		assert.deepEqual(keys.reusableKeys('openai', WORKSPACE), []);
+		await keys.store('openai', WORKSPACE, 'sk-own', IDENTITY, URL_A);
+		assert.deepEqual(pick(URL_A, false), []);
 	});
 
-	test('copies the key to this workspace, where it resolves from SecretStorage', async () => {
-		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY);
-		const source = keys.secretNameFor('openai', OTHER);
+	test('the offered entries never carry the key value', async () => {
+		await keys.store('openai', OTHER, 'sk-secret-value', OTHER_IDENTITY, URL_A);
+		assert.equal(JSON.stringify(pick(URL_A, true)).includes('sk-secret-value'), false);
+		assert.equal(JSON.stringify(registry.list()).includes('sk-secret-value'), false);
+	});
 
-		assert.equal(await keys.copyFrom(source, 'openai', WORKSPACE, IDENTITY), true);
+	test('a workspace provider reusing a known id with another base URL is offered nothing', async () => {
+		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY, URL_A);
+		assert.deepEqual(pick(URL_B, true), []);
+		assert.deepEqual(pick(URL_B, false), [], 'a key with known provenance is never offered to a different endpoint');
+		assert.deepEqual(pick('https://api.example.com/v1/other', true), [], 'match is on the exact base URL, not the origin');
+	});
 
-		const resolved = await keys.resolve(PROVIDER, SCOPE, 'user');
+	test('a workspace provider is offered a key recorded for exactly its base URL, marked verified', async () => {
+		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY, URL_A);
+		const offered = pick(URL_A, true);
+		assert.equal(offered.length, 1);
+		assert.equal(offered[0].verified, true);
+	});
+
+	test('keys without provenance are never verified and never offered to workspace providers', async () => {
+		await keys.store('openai', OTHER, 'sk-legacy', OTHER_IDENTITY);
+		assert.deepEqual(pick(URL_A, true), []);
+		const offered = pick(URL_A, false);
+		assert.equal(offered.length, 1);
+		assert.equal(offered[0].verified, false);
+	});
+
+	test('adopted keys get no provenance', async () => {
+		const name = keys.secretNameFor('openai', OTHER);
+		secrets.entries.set(name, 'sk-adopted');
+		await keys.resolve(PROVIDER, { workspaceKey: OTHER, identityUri: OTHER_IDENTITY }, 'user');
+		assert.equal(registry.get(name)?.adopted, true);
+		assert.equal(registry.get(name)?.baseUrl, undefined);
+		assert.deepEqual(pick(URL_A, true), []);
+	});
+
+	test('re-storing without a base URL drops the old provenance', async () => {
+		await keys.store('openai', OTHER, 'sk-old', OTHER_IDENTITY, URL_A);
+		await keys.store('openai', OTHER, 'sk-new', OTHER_IDENTITY);
+		assert.equal(registry.get(keys.secretNameFor('openai', OTHER))?.baseUrl, undefined);
+	});
+
+	test('reaffirming a recycled key keeps its provenance, the value is unchanged', async () => {
+		await keys.store('openai', WORKSPACE, 'sk-own', IDENTITY, URL_A);
+		birthtime = 9_000_000;
+		build2();
+		const withheld = (await keys.resolve(PROVIDER, SCOPE, 'user')).withheld;
+		assert.ok(withheld, 'the recycled-path guard still withholds the key');
+		assert.deepEqual(pick(URL_A, true), [], 'a withheld own key is not offered as a reuse source to itself');
+		await keys.reaffirm(withheld, SCOPE);
+		assert.equal(registry.get(keys.secretNameFor('openai', WORKSPACE))?.baseUrl, URL_A);
+	});
+
+	test('a verified copy carries provenance and resolves from SecretStorage', async () => {
+		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY, URL_A);
+		const [entry] = pick(URL_A, true);
+
+		assert.equal(await keys.copyFrom(entry, 'openai', URL_A, WORKSPACE, IDENTITY), true);
+
+		const resolved = await keys.resolve(PROVIDER, SCOPE, 'workspace');
 		assert.equal(isResolvedKey(resolved) && resolved.key, 'sk-other');
 		assert.equal(isResolvedKey(resolved) && resolved.source, 'secret');
-		assert.equal(secrets.entries.get(source), 'sk-other', 'the source key is left in place');
-		assert.equal(keys.storedKeys().length, 2);
+		assert.equal(secrets.entries.get(entry.name), 'sk-other', 'the source key is left in place');
+		assert.equal(registry.get(keys.secretNameFor('openai', WORKSPACE))?.baseUrl, URL_A);
+	});
+
+	test('an unverified copy stays unverified', async () => {
+		await keys.store('openai', OTHER, 'sk-legacy', OTHER_IDENTITY);
+		const [entry] = pick(URL_A, false);
+		assert.equal(await keys.copyFrom(entry, 'openai', URL_A, WORKSPACE, IDENTITY), true);
+		assert.equal(registry.get(keys.secretNameFor('openai', WORKSPACE))?.baseUrl, undefined);
+	});
+
+	test('a forged verified flag for an entry without provenance is refused', async () => {
+		await keys.store('openai', OTHER, 'sk-legacy', OTHER_IDENTITY);
+		const [entry] = pick(URL_A, false);
+		assert.equal(await keys.copyFrom({ ...entry, verified: true }, 'openai', URL_A, WORKSPACE, IDENTITY), false);
+		assert.equal(secrets.entries.has(keys.secretNameFor('openai', WORKSPACE)), false);
+	});
+
+	test('refuses when the source provenance changed after it was offered', async () => {
+		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY, URL_A);
+		const [entry] = pick(URL_A, true);
+		await keys.store('openai', OTHER, 'sk-replaced', OTHER_IDENTITY, URL_B);
+
+		assert.equal(await keys.copyFrom(entry, 'openai', URL_A, WORKSPACE, IDENTITY), false);
+		assert.equal(secrets.entries.has(keys.secretNameFor('openai', WORKSPACE)), false);
+	});
+
+	test('refuses when the source was overwritten with a different endpoint while the secret was being read', async () => {
+		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY, URL_A);
+		const [entry] = pick(URL_A, true);
+		const original = secrets.get.bind(secrets);
+		secrets.get = async (key: string) => {
+			const value = await original(key);
+			secrets.get = original;
+			await keys.store('openai', OTHER, 'sk-replaced', OTHER_IDENTITY, URL_B);
+			return value;
+		};
+
+		assert.equal(await keys.copyFrom(entry, 'openai', URL_A, WORKSPACE, IDENTITY), false);
+		assert.equal(secrets.entries.has(keys.secretNameFor('openai', WORKSPACE)), false);
+	});
+
+	test('refuses when the picked entry is not the one now recorded under that name', async () => {
+		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY, URL_A);
+		const [entry] = pick(URL_A, true);
+		// A deleted-and-recreated source has a different storedAt than the one picked.
+		assert.equal(await keys.copyFrom({ ...entry, storedAt: entry.storedAt - 1 }, 'openai', URL_A, WORKSPACE, IDENTITY), false);
+		assert.equal(secrets.entries.has(keys.secretNameFor('openai', WORKSPACE)), false);
 	});
 
 	test('returns false when the source secret no longer exists', async () => {
-		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY);
-		const source = keys.secretNameFor('openai', OTHER);
-		secrets.entries.delete(source);
+		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY, URL_A);
+		const [entry] = pick(URL_A, true);
+		secrets.entries.delete(entry.name);
 
-		assert.equal(await keys.copyFrom(source, 'openai', WORKSPACE, IDENTITY), false);
+		assert.equal(await keys.copyFrom(entry, 'openai', URL_A, WORKSPACE, IDENTITY), false);
 		assert.equal(secrets.entries.size, 0);
 	});
 
 	test('refuses to copy a key that belongs to a different provider', async () => {
-		await keys.store('anthropic', OTHER, 'sk-different-provider', OTHER_IDENTITY);
-		const source = keys.secretNameFor('anthropic', OTHER);
+		await keys.store('anthropic', OTHER, 'sk-anthropic', OTHER_IDENTITY, URL_A);
+		const entry = {
+			name: keys.secretNameFor('anthropic', OTHER),
+			verified: true,
+			storedAt: registry.get(keys.secretNameFor('anthropic', OTHER))!.storedAt,
+			revision: registry.get(keys.secretNameFor('anthropic', OTHER))!.revision,
+		};
 
-		assert.equal(await keys.copyFrom(source, 'openai', WORKSPACE, IDENTITY), false);
+		assert.equal(await keys.copyFrom(entry, 'openai', URL_A, WORKSPACE, IDENTITY), false);
 		assert.equal(secrets.entries.has(keys.secretNameFor('openai', WORKSPACE)), false);
+	});
+
+	test('refuses a source re-stored in the same millisecond with the same endpoint', async () => {
+		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY, URL_A);
+		const [entry] = pick(URL_A, true);
+		await keys.store('openai', OTHER, 'sk-replaced', OTHER_IDENTITY, URL_A);
+		assert.equal(registry.get(entry.name)?.storedAt, entry.storedAt, 'storedAt cannot distinguish the two versions');
+		assert.equal(await keys.copyFrom(entry, 'openai', URL_A, WORKSPACE, IDENTITY), false);
+		assert.equal(secrets.entries.has(keys.secretNameFor('openai', WORKSPACE)), false);
+	});
+
+	test('refuses when the source is re-stored with the same endpoint while its secret is read', async () => {
+		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY, URL_A);
+		const [entry] = pick(URL_A, true);
+		const original = secrets.get.bind(secrets);
+		secrets.get = async (key: string) => {
+			const value = await original(key);
+			secrets.get = original;
+			await keys.store('openai', OTHER, 'sk-replaced', OTHER_IDENTITY, URL_A);
+			return value;
+		};
+		assert.equal(await keys.copyFrom(entry, 'openai', URL_A, WORKSPACE, IDENTITY), false);
+		assert.equal(secrets.entries.has(keys.secretNameFor('openai', WORKSPACE)), false);
+	});
+
+	test('a legacy entry without a revision is refused once rewritten', async () => {
+		await keys.store('openai', OTHER, 'sk-other', OTHER_IDENTITY);
+		const [entry] = pick(URL_A, false);
+		await keys.store('openai', OTHER, 'sk-other-2', OTHER_IDENTITY);
+		assert.equal(await keys.copyFrom(entry, 'openai', URL_A, WORKSPACE, IDENTITY), false);
+	});
+
+	test('store refuses and writes nothing when the destination check fails', async () => {
+		assert.equal(await keys.store('openai', WORKSPACE, 'sk-x', IDENTITY, URL_A, () => false), false);
+		assert.equal(secrets.entries.size, 0);
+	});
+
+	test('refuses to copy a key onto itself', async () => {
+		await keys.store('openai', WORKSPACE, 'sk-own', IDENTITY, URL_A);
+		const name = keys.secretNameFor('openai', WORKSPACE);
+		assert.equal(
+			await keys.copyFrom(
+				{ name, verified: true, storedAt: registry.get(name)!.storedAt, revision: registry.get(name)!.revision },
+				'openai',
+				URL_A,
+				WORKSPACE,
+				IDENTITY,
+			),
+			false,
+		);
 	});
 });
 

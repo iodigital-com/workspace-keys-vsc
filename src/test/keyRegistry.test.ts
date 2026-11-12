@@ -105,6 +105,28 @@ describe('KeyRegistry', () => {
 		assert.equal('birthtimeMs' in (registry.get('workspace-keys:openai:abc123') ?? {}), false);
 	});
 
+	test('every record and adopt writes a fresh revision, even in the same millisecond', async () => {
+		const store = new (class implements RegistryStore {
+			v: Record<string, unknown> = {};
+			get<T>(k: string, d: T): T {
+				return (this.v[k] as T) ?? d;
+			}
+			async update(k: string, value: unknown): Promise<void> {
+				this.v[k] = value;
+			}
+		})();
+		const reg = new KeyRegistry(store, () => 42);
+		await reg.adopt('a', { providerId: 'p', hash: 'h', label: 'l', birthtimeMs: undefined });
+		const first = reg.get('a')?.revision;
+		await reg.record('a', { providerId: 'p', hash: 'h', label: 'l', birthtimeMs: undefined });
+		const second = reg.get('a')?.revision;
+		await reg.record('a', { providerId: 'p', hash: 'h', label: 'l', birthtimeMs: undefined });
+		const third = reg.get('a')?.revision;
+		assert.ok(first && second && third);
+		assert.equal(new Set([first, second, third]).size, 3);
+		assert.equal(reg.get('a')?.storedAt, 42);
+	});
+
 	test('keeps the original storedAt when a key is re-recorded', async () => {
 		await registry.record('n', INPUT);
 		now += 30 * DAY;

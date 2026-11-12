@@ -12,6 +12,7 @@
  * `node --test` — the store is injected as a narrow interface that
  * `context.globalState` happens to satisfy.
  */
+import { randomUUID } from 'node:crypto';
 
 /** Written to `globalState` under this key. */
 export const INDEX_KEY = 'workspaceKeys.storedKeys';
@@ -22,6 +23,14 @@ export const INDEX_KEY = 'workspaceKeys.storedKeys';
  * beyond that counts as "a different directory".
  */
 export const BIRTHTIME_TOLERANCE_MS = 2_000;
+
+let revisionCounter = 0;
+
+/** Unique per write within this process and, via the random part, across windows. */
+function nextRevision(): string {
+	revisionCounter += 1;
+	return `${Date.now().toString(36)}-${revisionCounter.toString(36)}-${randomUUID()}`;
+}
 
 /** How stale `lastUsedAt` may get before it is written again. Keeps discovery off the disk. */
 const TOUCH_INTERVAL_MS = 24 * 60 * 60 * 1_000;
@@ -54,6 +63,19 @@ export interface KeyRecord {
 	birthtimeMs?: number;
 	/** True when the entry was inferred from an existing secret rather than written on store. */
 	adopted?: boolean;
+	/**
+	 * Normalised base URL the key was entered for, recorded by this extension at
+	 * store time. Absent on entries written before it was recorded and on
+	 * adopted entries: their endpoint is unknown and must not be guessed.
+	 */
+	baseUrl?: string;
+	/**
+	 * Opaque value replaced on every `record` and `adopt`, i.e. on every write
+	 * that can accompany a change of the secret or its provenance. `storedAt` is
+	 * kept across re-records and so cannot tell two versions apart. Absent on
+	 * entries written before it existed; any later write adds one.
+	 */
+	revision?: string;
 }
 
 export interface StoredKey extends KeyRecord {
@@ -66,6 +88,8 @@ export interface RecordInput {
 	hash: string;
 	label: string;
 	birthtimeMs: number | undefined;
+	/** Endpoint provenance. Omitted means unknown: it is never inherited from an older entry. */
+	baseUrl?: string;
 }
 
 /**
@@ -135,6 +159,8 @@ export class KeyRegistry {
 			storedAt: existing?.storedAt ?? this.now(),
 			lastUsedAt: this.now(),
 			...(input.birthtimeMs !== undefined ? { birthtimeMs: input.birthtimeMs } : {}),
+			...(input.baseUrl !== undefined ? { baseUrl: input.baseUrl } : {}),
+			revision: nextRevision(),
 		});
 	}
 
@@ -154,6 +180,7 @@ export class KeyRegistry {
 			storedAt: this.now(),
 			lastUsedAt: this.now(),
 			adopted: true,
+			revision: nextRevision(),
 			...(input.birthtimeMs !== undefined ? { birthtimeMs: input.birthtimeMs } : {}),
 		});
 	}

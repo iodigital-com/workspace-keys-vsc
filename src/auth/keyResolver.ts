@@ -8,6 +8,11 @@ import { KeyRegistry, type StoredKey, isRecycled, pathLabel } from './keyRegistr
 import { secretName, workspaceHash } from './secretKey';
 import { type IdentitySource, birthtimeOf } from './workspaceIdentity';
 
+/** A stored key offered for reuse; `verified` means its recorded endpoint equals the current one exactly. */
+export interface ReusableKey extends StoredKey {
+	verified: boolean;
+}
+
 /**
  * The parts of a `WorkspaceScope` key resolution needs. Declared structurally so
  * this module does not have to depend on the configuration layer, and so a
@@ -52,7 +57,7 @@ export class KeyResolver {
 		private readonly env: Record<string, string | undefined> = process.env,
 		/** Injectable so the guard can be tested without depending on real file timestamps. */
 		private readonly probe: (source: IdentitySource | undefined) => Promise<number | undefined> = birthtimeOf,
-	) { }
+	) {}
 
 	secretNameFor(providerId: string, workspaceKey: string): string {
 		return secretName(providerId, workspaceHash(workspaceKey));
@@ -160,16 +165,44 @@ export class KeyResolver {
 		return value;
 	}
 
-	async store(providerId: string, workspaceKey: string, key: string, identityUri?: IdentitySource): Promise<void> {
+	/**
+	 * @param baseUrl the normalised endpoint the key was entered for. Only pass it
+	 * when the caller has just shown that endpoint to the user and re-checked it
+	 * is still configured; it becomes the provenance that `reusableKeys` trusts.
+	 * @param stillValid re-checked after the last await and immediately before
+	 * the secret is written; when it returns false nothing is written and
+	 * `store` returns false.
+	 */
+	async store(
+		providerId: string,
+		workspaceKey: string,
+		key: string,
+		identityUri?: IdentitySource,
+		baseUrl?: string,
+		stillValid: () => boolean = () => true,
+	): Promise<boolean> {
 		const name = this.secretNameFor(providerId, workspaceKey);
-		await this.secrets.store(name, key);
-		await this.registry.record(name, {
+		const input = {
 			providerId,
 			hash: workspaceHash(workspaceKey),
 			label: pathLabel(workspaceKey),
 			birthtimeMs: await this.birthtime(identityUri),
-		});
+		};
+		if (!stillValid()) {
+			return false;
+		}
+		// Replace the revision and drop old provenance before the value changes, so
+		// a concurrent copy that picked the old entry refuses whatever value it reads.
+		if (this.registry.get(name) !== undefined) {
+			await this.registry.record(name, input);
+			if (!stillValid()) {
+				return false;
+			}
+		}
+		await this.secrets.store(name, key);
+		await this.registry.record(name, { ...input, ...(baseUrl !== undefined ? { baseUrl } : {}) });
 		this.invalidate();
+		return true;
 	}
 
 	async clear(providerId: string, workspaceKey: string): Promise<void> {
@@ -178,32 +211,65 @@ export class KeyResolver {
 
 	/**
 	 * Keys stored for the same provider in other workspaces, most recently used
-	 * first. Restricted to one provider id on purpose: a key is only ever offered
-	 * back to the endpoint it was issued for.
+	 * first, each marked with whether its recorded endpoint is exactly `baseUrl`.
+	 *
+	 * The provider id alone is never authority: a workspace can declare any id.
+	 * With `requireVerified` (workspace-declared providers) only entries whose
+	 * recorded provenance equals `baseUrl` are returned. Entries without
+	 * provenance — stored before it was recorded, or adopted — are never
+	 * reported as verified.
 	 */
-	reusableKeys(providerId: string, workspaceKey: string): StoredKey[] {
+	reusableKeys(providerId: string, workspaceKey: string, baseUrl: string, requireVerified: boolean): ReusableKey[] {
 		const own = this.secretNameFor(providerId, workspaceKey);
 		return this.registry
 			.list()
 			.filter((entry) => entry.providerId === providerId && entry.name !== own)
+			.map((entry) => ({ ...entry, verified: entry.baseUrl !== undefined && entry.baseUrl === baseUrl }))
+			.filter((entry) => entry.verified || (!requireVerified && entry.baseUrl === undefined))
 			.sort((a, b) => (b.lastUsedAt ?? b.storedAt) - (a.lastUsedAt ?? a.storedAt));
 	}
 
 	/**
 	 * Copies a stored key to this workspace's secret name. The value never leaves
-	 * this class. Returns false when the source secret no longer exists, i.e. the
-	 * index entry was stale.
+	 * this class. Returns false when the source no longer matches what the user
+	 * picked: entry gone, provider or recorded endpoint changed, or the secret
+	 * missing. Compared on `revision`, which every write replaces (`storedAt`
+	 * survives re-records). The index is read again after the secret, so a value overwritten
+	 * meanwhile (see `store`) is not copied under the old provenance.
+	 *
+	 * Provenance is carried over only when the source was verified for
+	 * `baseUrl`; an unverified source yields an unverified copy.
 	 */
-	async copyFrom(sourceName: string, providerId: string, workspaceKey: string, identityUri?: IdentitySource): Promise<boolean> {
-		if (this.registry.get(sourceName)?.providerId !== providerId) {
+	async copyFrom(
+		picked: Pick<ReusableKey, 'name' | 'verified' | 'storedAt' | 'revision'>,
+		providerId: string,
+		baseUrl: string,
+		workspaceKey: string,
+		identityUri?: IdentitySource,
+		destinationStillValid: () => boolean = () => true,
+	): Promise<boolean> {
+		const matches = (): boolean => {
+			const record = this.registry.get(picked.name);
+			if (!record || record.providerId !== providerId || record.storedAt !== picked.storedAt || record.revision !== picked.revision) {
+				return false;
+			}
+			return picked.verified ? record.baseUrl === baseUrl : record.baseUrl === undefined;
+		};
+		if (picked.name === this.secretNameFor(providerId, workspaceKey) || !matches() || !destinationStillValid()) {
 			return false;
 		}
-		const value = await this.secrets.get(sourceName);
-		if (!value) {
+		const value = await this.secrets.get(picked.name);
+		if (!value || !matches()) {
 			return false;
 		}
-		await this.store(providerId, workspaceKey, value, identityUri);
-		return true;
+		return this.store(
+			providerId,
+			workspaceKey,
+			value,
+			identityUri,
+			picked.verified ? baseUrl : undefined,
+			() => matches() && destinationStillValid(),
+		);
 	}
 
 	/**
@@ -215,7 +281,10 @@ export class KeyResolver {
 		if (!scope.workspaceKey) {
 			return;
 		}
+		// The value is unchanged, so its endpoint provenance stays valid.
+		const recorded = this.registry.get(withheld.secretName)?.baseUrl;
 		await this.registry.record(withheld.secretName, {
+			...(recorded !== undefined ? { baseUrl: recorded } : {}),
 			providerId: withheld.providerId,
 			hash: workspaceHash(scope.workspaceKey),
 			label: pathLabel(scope.workspaceKey),
